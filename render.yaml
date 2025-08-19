@@ -1,0 +1,10 @@
+services:
+  - type: web
+    name: euisinchung-api
+    env: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn server_app:app --host 0.0.0.0 --port $PORT
+    envVars:
+      - key: DATABASE_URL
+        sync: false  # Render 대시보드에서 Neon 연결문자열 붙여넣기
