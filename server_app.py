@@ -1,35 +1,60 @@
 # server_app.py
-import os, secrets, datetime as dt
+import os, secrets, datetime as dt, logging
 from typing import Optional, List
+from urllib.parse import urlparse, parse_qsl, urlencode, urlunparse
 
 from fastapi import FastAPI, HTTPException, Depends, Header, status
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from starlette.responses import RedirectResponse, Response
+from starlette.responses import RedirectResponse, Response, JSONResponse
 
 from sqlalchemy import (
     create_engine, String, Integer, Boolean, DateTime, ForeignKey,
-    func, select, UniqueConstraint
+    func, select
 )
 from sqlalchemy.orm import declarative_base, relationship, sessionmaker, Session, Mapped, mapped_column
 from passlib.hash import bcrypt
 
-# ------------------ 환경 ------------------
-DATABASE_URL = os.getenv("DATABASE_URL", "").strip() or "sqlite:///./app.db"
+log = logging.getLogger("uvicorn.error")
 
+# ------------------ DB URL sanitize ------------------
+def _sanitize_db_url(url: str) -> str:
+    if not url:
+        return url
+    try:
+        u = urlparse(url)
+        qs = dict(parse_qsl(u.query, keep_blank_values=True))
+        # 문제 유발: channel_binding=require → 제거
+        qs.pop("channel_binding", None)
+        # ssl 모드는 기본 require 유지
+        qs.setdefault("sslmode", "require")
+        return urlunparse(u._replace(query=urlencode(qs)))
+    except Exception:
+        return url
+
+RAW_DB_URL = os.getenv("DATABASE_URL", "").strip()
+DATABASE_URL = _sanitize_db_url(RAW_DB_URL) or "sqlite:///./app.db"
+
+# ------------------ SQLAlchemy engine ------------------
 def _make_engine(url: str):
     if url.startswith("sqlite"):
         return create_engine(url, future=True, connect_args={"check_same_thread": False})
     return create_engine(
-        url, future=True, pool_pre_ping=True, pool_size=5, max_overflow=2,
-        pool_recycle=280, pool_timeout=10
+        url,
+        future=True,
+        pool_pre_ping=True,
+        pool_size=5,
+        max_overflow=2,
+        pool_recycle=280,
+        pool_timeout=10,
     )
 
 engine = _make_engine(DATABASE_URL)
 SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False, future=True)
 Base = declarative_base()
+DB_READY = False  # 헬스 상태 보관
 
-# ------------------ 모델 ------------------
+# ------------------ Models ------------------
 class User(Base):
     __tablename__ = "users"
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
@@ -51,14 +76,14 @@ class SessionToken(Base):
     user: Mapped[User] = relationship("User", back_populates="sessions")
 
 # ------------------ FastAPI ------------------
-app = FastAPI(title="EuiSinChung API", version="1.0.0")
+app = FastAPI(title="EuiSinChung API", version="1.0.1")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"], allow_methods=["*"], allow_headers=["*"]
+    allow_origins=["*"], allow_methods=["*"], allow_headers=["*"],
 )
 
-# ------------------ 유틸/의존성 ------------------
+# ------------------ utils/deps ------------------
 def get_db():
     db = SessionLocal()
     try:
@@ -67,7 +92,6 @@ def get_db():
         db.close()
 
 def ensure_admin_exists(db: Session):
-    """부팅 시 관리자 계정 보장(rnj88 / 6548)."""
     admin = db.execute(select(User).where(User.username == "rnj88")).scalar_one_or_none()
     if not admin:
         u = User(
@@ -79,10 +103,6 @@ def ensure_admin_exists(db: Session):
         )
         db.add(u)
         db.commit()
-    else:
-        # 혹시 비번 초기화가 필요하면 주석 해제
-        # admin.password_hash = bcrypt.hash("6548"); db.commit()
-        pass
 
 def bearer_token(auth_header: Optional[str]) -> str:
     if not auth_header or not auth_header.lower().startswith("bearer "):
@@ -90,9 +110,7 @@ def bearer_token(auth_header: Optional[str]) -> str:
     return auth_header.split(" ", 1)[1].strip()
 
 def require_user(db: Session, token: str) -> User:
-    sess = db.execute(
-        select(SessionToken).where(SessionToken.token == token, SessionToken.revoked == False)
-    ).scalar_one_or_none()
+    sess = db.execute(select(SessionToken).where(SessionToken.token == token, SessionToken.revoked == False)).scalar_one_or_none()
     if not sess:
         raise HTTPException(status_code=401, detail="invalid token")
     user = db.get(User, sess.user_id)
@@ -106,16 +124,24 @@ def require_admin(db: Session, token: str) -> User:
         raise HTTPException(status_code=403, detail="admin only")
     return user
 
-# ------------------ 스타트업 ------------------
+# ------------------ startup ------------------
 @app.on_event("startup")
 def on_startup():
-    Base.metadata.create_all(bind=engine)
-    with SessionLocal() as db:
-        # DB 연결 확인 + 관리자 보장
-        db.execute(select(func.now()))
-        ensure_admin_exists(db)
+    global DB_READY
+    try:
+        Base.metadata.create_all(bind=engine)
+        with SessionLocal() as db:
+            # DB 핑 + 관리자 보장
+            db.execute(select(func.now()))
+            ensure_admin_exists(db)
+        DB_READY = True
+        log.info("DB ready (url sanitized=%s)", DATABASE_URL != RAW_DB_URL)
+    except Exception as e:
+        # 서버가 죽지 않게 하고, /status에서 원인 노출
+        DB_READY = False
+        log.exception("DB init failed: %s", e)
 
-# ------------------ 기본 엔드포인트 ------------------
+# ------------------ base endpoints ------------------
 @app.get("/", include_in_schema=False)
 def root():
     return RedirectResponse(url="/docs", status_code=307)
@@ -126,9 +152,19 @@ def favicon():
 
 @app.get("/status")
 def status():
-    return {"ok": True, "db": ("sqlite" if DATABASE_URL.startswith("sqlite") else "postgres")}
+    return {
+        "ok": True,
+        "db_ready": DB_READY,
+        "db_kind": ("sqlite" if DATABASE_URL.startswith("sqlite") else "postgres"),
+        "url_sanitized": (DATABASE_URL != RAW_DB_URL),
+    }
 
-# ------------------ 인증 ------------------
+# 공통: DB 미준비시 503으로 명시
+def _guard_db():
+    if not DB_READY:
+        return JSONResponse(status_code=503, content={"ok": False, "error": "database not ready"})
+
+# ------------------ auth ------------------
 class LoginIn(BaseModel):
     username: str
     password: str
@@ -141,30 +177,36 @@ class LoginOut(BaseModel):
 
 @app.post("/auth/start_session", response_model=LoginOut)
 def start_session(body: LoginIn, db: Session = Depends(get_db)):
-    user = db.execute(select(User).where(User.username == body.username)).scalar_one_or_none()
-    # 혹시 관리자 계정이 사라졌다면 즉시 복구
-    if not user and body.username == "rnj88":
-        ensure_admin_exists(db)
-        user = db.execute(select(User).where(User.username == "rnj88")).scalar_one()
+    guard = _guard_db()
+    if guard:  # DB 안 되면 즉시 503
+        return guard
 
-    if not user or not bcrypt.verify(body.password, user.password_hash):
-        raise HTTPException(status_code=401, detail="invalid credentials")
+    try:
+        user = db.execute(select(User).where(User.username == body.username)).scalar_one_or_none()
+        if not user and body.username == "rnj88":
+            ensure_admin_exists(db)
+            user = db.execute(select(User).where(User.username == "rnj88")).scalar_one()
 
-    # 강제 로그인: 이전 세션 무효화
-    if body.force:
-        db.execute(
-            select(SessionToken).where(SessionToken.user_id == user.id, SessionToken.revoked == False)
-        )
-        db.query(SessionToken).filter(SessionToken.user_id == user.id, SessionToken.revoked == False).update({"revoked": True})
+        if not user or not bcrypt.verify(body.password, user.password_hash):
+            raise HTTPException(status_code=401, detail="invalid credentials")
+
+        # force: 이전 세션 revoke
+        if body.force:
+            db.query(SessionToken).filter(SessionToken.user_id == user.id, SessionToken.revoked == False).update({"revoked": True})
+            db.commit()
+
+        token = secrets.token_urlsafe(32)
+        db.add(SessionToken(token=token, user_id=user.id, revoked=False))
         db.commit()
 
-    token = secrets.token_urlsafe(32)
-    sess = SessionToken(token=token, user_id=user.id, revoked=False)
-    db.add(sess); db.commit()
+        return {"ok": True, "token": token, "user": {"username": user.username, "hospital": user.hospital, "role": user.role}}
+    except HTTPException:
+        raise
+    except Exception as e:
+        log.exception("login failed: %s", e)
+        raise HTTPException(status_code=500, detail="internal error")
 
-    return {"ok": True, "token": token, "user": {"username": user.username, "hospital": user.hospital, "role": user.role}}
-
-# ------------------ 사용자 관리(관리자용) ------------------
+# ------------------ users (admin) ------------------
 class CreateUserIn(BaseModel):
     username: str
     password: str
@@ -172,8 +214,10 @@ class CreateUserIn(BaseModel):
 
 @app.get("/users")
 def list_users(Authorization: Optional[str] = Header(None), db: Session = Depends(get_db)):
+    guard = _guard_db()
+    if guard: return guard
     token = bearer_token(Authorization)
-    admin = require_admin(db, token)
+    _ = require_admin(db, token)
     rows = db.execute(select(User).order_by(User.id)).scalars().all()
     return {"ok": True, "items": [
         {"id": u.id, "username": u.username, "hospital": u.hospital, "role": u.role, "active": u.active, "created_at": u.created_at}
@@ -182,8 +226,10 @@ def list_users(Authorization: Optional[str] = Header(None), db: Session = Depend
 
 @app.post("/users", status_code=201)
 def create_user(body: CreateUserIn, Authorization: Optional[str] = Header(None), db: Session = Depends(get_db)):
+    guard = _guard_db()
+    if guard: return guard
     token = bearer_token(Authorization)
-    admin = require_admin(db, token)
+    _ = require_admin(db, token)
     exists = db.execute(select(User).where(User.username == body.username)).scalar_one_or_none()
     if exists:
         raise HTTPException(status_code=409, detail="duplicate username")
@@ -196,6 +242,8 @@ def create_user(body: CreateUserIn, Authorization: Optional[str] = Header(None),
     )
     db.add(u); db.commit()
     return {"ok": True, "id": u.id}
+
+
 
 
 
