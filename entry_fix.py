@@ -51,4 +51,8 @@ def attach_entry_routes(app: FastAPI, target: str = "/app") -> None:
     async def _app_shell():
         return HTMLResponse(HTML_SHELL)
 
+from entry_fix import attach_entry_routes
+attach_entry_routes(app, target="/app")   # "/"와 "/login"을 /app으로 고정
+
+
 
