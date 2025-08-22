@@ -1,8 +1,10 @@
 fastapi==0.111.0
-uvicorn[standard]==0.30.0
-SQLAlchemy==2.0.30
-psycopg2-binary==2.9.9
+uvicorn[standard]==0.30.3
+SQLAlchemy==2.0.32
 passlib[bcrypt]==1.7.4
-python-multipart==0.0.9
+bcrypt==4.1.3
+psycopg2-binary==2.9.9    # Render Postgres 쓰면 필수
+
+
 
 
