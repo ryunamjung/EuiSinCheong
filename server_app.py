@@ -6,7 +6,7 @@ from urllib.parse import urlparse, parse_qsl, urlencode, urlunparse
 from fastapi import FastAPI, HTTPException, Depends, Header, status
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from starlette.responses import RedirectResponse, Response, JSONResponse
+from starlette.responses import RedirectResponse, Response, JSONResponse, HTMLResponse
 
 from sqlalchemy import (
     create_engine, String, Integer, Boolean, DateTime, ForeignKey,
@@ -76,7 +76,7 @@ class SessionToken(Base):
     user: Mapped[User] = relationship("User", back_populates="sessions")
 
 # ------------------ FastAPI ------------------
-app = FastAPI(title="EuiSinChung API", version="1.0.1")
+app = FastAPI(title="EuiSinChung API", version="1.0.1")  # docs_url="/docs" 기본 유지
 
 app.add_middleware(
     CORSMiddleware,
@@ -141,10 +141,48 @@ def on_startup():
         DB_READY = False
         log.exception("DB init failed: %s", e)
 
-# ------------------ base endpoints ------------------
+# ------------------ entry/health ------------------
+APP_ENTRY = "/app"  # Electron이 열 최초 진입 경로
+
+@app.head("/", include_in_schema=False)
+def head_root():
+    # Render 헬스체크가 HEAD / 를 호출 → 200으로 응답해 405 방지
+    return Response(status_code=200)
+
 @app.get("/", include_in_schema=False)
 def root():
-    return RedirectResponse(url="/docs", status_code=307)
+    # 루트는 항상 앱 진입으로 보냄 (Swagger로 보내지 않음)
+    return RedirectResponse(url=APP_ENTRY, status_code=307)
+
+@app.get("/login", include_in_schema=False)
+def login_redirect():
+    # 옛 경로로 접근해도 앱 진입으로
+    return RedirectResponse(url=APP_ENTRY, status_code=307)
+
+@app.get("/healthz", include_in_schema=False)
+def healthz():
+    return JSONResponse({"ok": True, "db_ready": DB_READY})
+
+# 아주 간단한 임시 UI 셸 (원한다면 정적파일/템플릿/프런트로 교체)
+APP_HTML = """<!doctype html><html lang="ko"><head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>AI이의신청프로그램</title>
+<style>
+  body{margin:0;background:#0b1220;color:#e5f0ff;font-family:Segoe UI,Arial}
+  .wrap{max-width:880px;margin:40px auto;padding:0 16px}
+  .card{background:linear-gradient(145deg,#0f172a,#0b1220);border:1px solid #1c2b47;border-radius:14px;padding:18px}
+  .btn{display:inline-block;padding:10px 14px;background:#22d3ee;color:#02242a;border-radius:10px;text-decoration:none;font-weight:700}
+</style></head><body><div class="wrap">
+<div class="card">
+  <h2>AI이의신청프로그램</h2>
+  <p>서버 연결이 정상입니다. 이 페이지는 임시 진입 셸입니다.</p>
+  <p>Electron의 <code>remote.entry</code>는 <strong>/app</strong> 으로 설정하세요.</p>
+  <p><a class="btn" href="/docs">API 문서 열기</a></p>
+</div></div></body></html>"""
+
+@app.get(APP_ENTRY, response_class=HTMLResponse, include_in_schema=False)
+def app_shell():
+    return HTMLResponse(APP_HTML)
 
 @app.get("/favicon.ico", include_in_schema=False)
 def favicon():
@@ -242,6 +280,8 @@ def create_user(body: CreateUserIn, Authorization: Optional[str] = Header(None),
     )
     db.add(u); db.commit()
     return {"ok": True, "id": u.id}
+
+
 
 
 
