@@ -1,15 +1,12 @@
 services:
   - type: web
-    name: euisinchung-api
-    runtime: python
-    region: singapore           # 원하시는 리전
+    name: ai-appeal-auth
+    env: python
+    region: singapore
     plan: free
-    buildCommand: pip install --upgrade pip && pip install -r requirements.txt
+    buildCommand: pip install -r requirements.txt
     startCommand: uvicorn server_app:app --host 0.0.0.0 --port $PORT
-    envVars:
-      - key: PYTHON_VERSION
-        value: 3.11.9           # 원하는 버전
-      - key: DATABASE_URL
-        sync: false             # Render 대시보드에서 값 입력
+
+
 
 
