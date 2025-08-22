@@ -1,132 +1,195 @@
-# server_app.py
-import os
-import logging
-import datetime as dt
-from typing import Generator, Optional
+import os, secrets, datetime as dt
+from typing import Optional, List
 from urllib.parse import urlparse, parse_qsl, urlencode, urlunparse
 
-from fastapi import FastAPI, Depends
+from fastapi import FastAPI, HTTPException, Depends, Header, status
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-
-from sqlalchemy import create_engine, text
-from sqlalchemy.orm import declarative_base, sessionmaker, Session
-
-# ------------------ Logging (강화) ------------------
-LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
-logging.basicConfig(
-    level=LOG_LEVEL,
-    format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
-)
-log = logging.getLogger("server")
+from sqlalchemy import create_engine, String, Date, DateTime
+from sqlalchemy.orm import declarative_base, sessionmaker, mapped_column, Mapped, Session
+from passlib.hash import bcrypt
 
 # ------------------ DB URL sanitize ------------------
-def _sanitize_db_url(url: Optional[str]) -> tuple[str, bool]:
-    """
-    Render의 PostgreSQL URL에 붙는 일부 쿼리옵션이 드물게 드라이버와 충돌할 수 있어 제거.
-    실패해도 원본을 그대로 사용.
-    """
+def _sanitize_db_url(url: str) -> str:
     if not url:
-        return "sqlite:///./app.db", False
-
+        return url
     try:
         u = urlparse(url)
+        scheme = u.scheme
+        # Render/Heroku often provide postgres:// — normalize to postgresql+psycopg2://
+        if scheme == "postgres":
+            scheme = "postgresql+psycopg2"
+        elif scheme == "postgresql":
+            # add driver explicitly for clarity
+            scheme = "postgresql+psycopg2"
+        # strip troublesome query parameters (e.g., channel_binding=require)
         qs = dict(parse_qsl(u.query, keep_blank_values=True))
-        removed = False
-        for k in ("channel_binding",):
-            if k in qs:
-                qs.pop(k, None)
-                removed = True
-        new_q = urlencode(qs, doseq=True)
-        sanitized = urlunparse((u.scheme, u.netloc, u.path, u.params, new_q, u.fragment))
-        return sanitized, removed
-    except Exception as e:
-        log.exception("DB URL sanitize skipped")
-        return url, False
+        qs.pop("channel_binding", None)
+        new_url = urlunparse((
+            scheme,
+            u.netloc,
+            u.path,
+            u.params,
+            urlencode(qs),
+            u.fragment
+        ))
+        return new_url
+    except Exception:
+        return url
 
+# --- Config ---
+DATABASE_URL = _sanitize_db_url(os.getenv("DATABASE_URL", "sqlite:///./users.db"))
+ADMIN_ID = os.getenv("ADMIN_ID", "rnj88")
+ADMIN_PW = os.getenv("ADMIN_PW", "6548")
 
-# ------------------ SQLAlchemy 기본 셋업 ------------------
-RAW_DB_URL = os.getenv("DATABASE_URL") or os.getenv("DB_URL")
-DB_URL, SANITIZED = _sanitize_db_url(RAW_DB_URL)
-
-connect_args = {}
-if DB_URL.startswith("sqlite"):
-    connect_args = {"check_same_thread": False}
-
-engine = create_engine(DB_URL, pool_pre_ping=True, connect_args=connect_args)
-SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+# --- DB setup ---
+engine = create_engine(
+    DATABASE_URL,
+    connect_args={"check_same_thread": False} if DATABASE_URL.startswith("sqlite") else {}
+)
+SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False)
 Base = declarative_base()
 
-def get_db() -> Generator[Session, None, None]:
+class User(Base):
+    __tablename__ = "users"
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)  # 로그인 아이디
+    password_hash: Mapped[str] = mapped_column(String(256))
+    org: Mapped[Optional[str]] = mapped_column(String(128), default=None)
+    dept: Mapped[Optional[str]] = mapped_column(String(128), default=None)
+    start_date: Mapped[Optional[dt.date]] = mapped_column(Date, default=None)
+    end_date: Mapped[Optional[dt.date]] = mapped_column(Date, default=None)
+    role: Mapped[str] = mapped_column(String(16), default="user")
+    created_at: Mapped[dt.datetime] = mapped_column(DateTime, default=lambda: dt.datetime.utcnow())
+
+class LoginIn(BaseModel):
+    id: str
+    password: str
+
+class UserIn(BaseModel):
+    id: str
+    password: Optional[str] = None
+    org: Optional[str] = None
+    dept: Optional[str] = None
+    start_date: Optional[dt.date] = None
+    end_date: Optional[dt.date] = None
+    role: Optional[str] = "user"
+
+class UserOut(BaseModel):
+    id: str
+    org: Optional[str] = None
+    dept: Optional[str] = None
+    start_date: Optional[dt.date] = None
+    end_date: Optional[dt.date] = None
+    role: str
+
+app = FastAPI(title="AI 이의신청프로그램 Auth API (ryoryocompany v0.3.1)")
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+def get_db():
     db = SessionLocal()
     try:
         yield db
     finally:
         db.close()
 
+# create tables
+Base.metadata.create_all(engine)
 
-# ------------------ FastAPI App ------------------
-app = FastAPI(title="EuiSinChung API", version="1.0.0")
+# seed or UPDATE admin (upsert behavior)
+with SessionLocal() as db:
+    u = db.get(User, ADMIN_ID)
+    if not u:
+        db.add(User(id=ADMIN_ID, password_hash=bcrypt.hash(ADMIN_PW), role="admin"))
+    else:
+        # always sync password with env for recovery
+        u.password_hash = bcrypt.hash(ADMIN_PW)
+    db.commit()
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],  # 필요 시 허용 도메인만 남기세요
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+# --- Token store (demo) ---
+TOKENS = {}
 
-# ------------------ Schemas ------------------
-class HealthOut(BaseModel):
-    status: str
-    db_ok: bool
-    time: str
+def make_token(uid: str) -> str:
+    token = secrets.token_hex(16)
+    TOKENS[token] = {"id": uid, "ts": dt.datetime.utcnow()}
+    return token
 
-# ------------------ Startup (예외 삼키기) ------------------
-@app.on_event("startup")
-def on_startup():
-    try:
-        log.info("Booting... (sanitized_db_url=%s)", SANITIZED)
-        # 필요 시 테이블 자동 생성
-        # Base.metadata.create_all(bind=engine)
+def validate_token(x_auth: str = Header(..., alias="X-Auth"), db: Session = Depends(get_db)) -> User:
+    info = TOKENS.get(x_auth)
+    if not info:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="no token")
+    u = db.get(User, info["id"])
+    if not u:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="invalid token")
+    return u
 
-        # DB 연결 간단 확인 (드라이버/네트워크 문제 시 여기서 터짐)
-        with engine.connect() as conn:
-            conn.execute(text("SELECT 1"))
-        log.info("DB ready")
-    except Exception:
-        # 어떤 예외든 로그에 '스택트레이스' 남기고 서비스는 기동 유지
-        log.exception("Startup DB check failed (service will still start)")
+@app.get("/")
+def health():
+    return {"ok": True, "service": "ai-appeal-auth", "brand": "ryoryocompany", "version": "v0.3.1"}
 
-# ------------------ Health / Meta ------------------
-@app.get("/", tags=["meta"])
-def root():
-    return {"ok": True, "time": dt.datetime.utcnow().isoformat() + "Z"}
+@app.post("/auth/login")
+def login(body: LoginIn, db: Session = Depends(get_db)):
+    u = db.get(User, body.id)
+    if not u:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="invalid credentials: user not found")
+    if not bcrypt.verify(body.password, u.password_hash):
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="invalid credentials: wrong password")
+    return {"token": make_token(u.id), "role": u.role, "displayName": u.id}
 
-@app.get("/healthz", response_model=HealthOut, include_in_schema=False)
-def healthz(db: Session = Depends(get_db)):
-    db_ok = True
-    try:
-        db.execute(text("SELECT 1"))
-    except Exception:
-        db_ok = False
-        log.exception("/healthz DB check failed")
-    return HealthOut(status="ok", db_ok=db_ok, time=dt.datetime.utcnow().isoformat() + "Z")
+@app.get("/users")
+def list_users(current: User = Depends(validate_token), db: Session = Depends(get_db)) -> List[UserOut]:
+    if current.role != "admin":
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="forbidden")
+    rows = db.query(User).all()
+    return [UserOut(id=u.id, org=u.org, dept=u.dept, start_date=u.start_date, end_date=u.end_date, role=u.role) for u in rows]
 
-@app.get("/api/ping", tags=["meta"])
-def ping():
-    return {"pong": True}
+@app.post("/users")
+def create_user(body: UserIn, current: User = Depends(validate_token), db: Session = Depends(get_db)):
+    if current.role != "admin":
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="forbidden")
+    if db.get(User, body.id):
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="exists")
+    db.add(User(
+        id=body.id,
+        password_hash=bcrypt.hash(body.password or "1111"),
+        org=body.org, dept=body.dept,
+        start_date=body.start_date, end_date=body.end_date,
+        role=body.role or "user"
+    ))
+    db.commit()
+    return {"ok": True}
 
-# ------------------ Local run (옵션) ------------------
-if __name__ == "__main__":
-    import uvicorn
-    port = int(os.getenv("PORT", "8000"))
-    uvicorn.run(
-        "server_app:app",
-        host="0.0.0.0",
-        port=port,
-        log_level=LOG_LEVEL.lower(),
-    )
+@app.put("/users/{uid}")
+def update_user(uid: str, body: UserIn, current: User = Depends(validate_token), db: Session = Depends(get_db)):
+    if current.role != "admin":
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="forbidden")
+    u = db.get(User, uid)
+    if not u:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="not found")
+    if body.password:
+        u.password_hash = bcrypt.hash(body.password)
+    for f in ["org", "dept", "start_date", "end_date", "role"]:
+        v = getattr(body, f)
+        if v is not None:
+            setattr(u, f, v)
+    db.commit()
+    return {"ok": True}
+
+@app.delete("/users/{uid}")
+def delete_user(uid: str, current: User = Depends(validate_token), db: Session = Depends(get_db)):
+    if current.role != "admin":
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="forbidden")
+    u = db.get(User, uid)
+    if not u:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="not found")
+    db.delete(u)
+    db.commit()
+    return {"ok": True}
+
 
 
 
