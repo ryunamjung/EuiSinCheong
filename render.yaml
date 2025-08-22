@@ -1,11 +1,11 @@
 services:
   - type: web
-    name: ai-appeal-auth
+    name: ryoryocompany-ai-appeal-auth
     env: python
-    region: singapore
     plan: free
     buildCommand: pip install -r requirements.txt
     startCommand: uvicorn server_app:app --host 0.0.0.0 --port $PORT
+
 
 
 
