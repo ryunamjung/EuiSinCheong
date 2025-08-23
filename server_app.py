@@ -1,310 +1,513 @@
 # server_app.py
 import os
 import uuid
-import logging
-from datetime import datetime, timedelta, timezone
-from typing import Optional, Dict, Any
+import bcrypt
+import jwt
+import datetime as dt
+from typing import Optional, List
 
-from fastapi import FastAPI, Depends, HTTPException, Header, Request
+from fastapi import FastAPI, Depends, HTTPException, Header, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from sqlalchemy import create_engine, text
-from sqlalchemy.orm import sessionmaker
-from passlib.context import CryptContext
-import jwt  # PyJWT
 
-# ------------------------------------------------------------
-# 환경설정
-# ------------------------------------------------------------
+from sqlalchemy import (
+    create_engine, text, String, Boolean, Date, DateTime, func,
+    ForeignKey, select
+)
+from sqlalchemy.orm import (
+    DeclarativeBase, Mapped, mapped_column, relationship, Session, sessionmaker
+)
+
+
+# -----------------------------------------------------------------------------
+# Config / DB URL normalize
+# -----------------------------------------------------------------------------
 SERVICE_NAME = "ai-appeal-auth"
-BRAND = os.getenv("BRAND", "ryoryocompany")
 VERSION = "v0.3.5"
 
-RAW_DB_URL = os.getenv("DATABASE_URL", "").strip()
-SECRET_KEY = os.getenv("SECRET_KEY", "PLEASE_CHANGE_ME_TO_RANDOM_SECRET")
-JWT_EXPIRE_HOURS = int(os.getenv("JWT_EXPIRE_HOURS", "12"))
-ALGORITHM = "HS256"
-
-def _normalize_db_url(url: str) -> str:
+def normalize_db_url(raw: Optional[str]) -> Optional[str]:
     """
-    SQLAlchemy가 파싱 가능한 형태로 DB URL을 정리.
-    - 지원: postgresql://..., postgresql+psycopg2://..., sqlite:///...
+    DATABASE_URL을 SQLAlchemy가 이해하는 형태로 정규화.
+    - postgresql://...  혹은 postgresql+psycopg2://... 허용
+    - sqlite:///...     허용
     """
-    if not url:
-        return "sqlite:///./users.db"
+    if not raw:
+        return None
+    s = raw.strip()
 
-    lower = url.lower()
-    if lower.startswith("postgres://"):
-        # 오래된 스킴 → postgresql로 치환
-        url = "postgresql://" + url.split("://", 1)[1]
+    # 흔한 실수 방지: 'psql+psycopg2:' 같은 틀린 프리픽스 제거
+    if s.startswith("psql+psycopg2:"):
+        s = s.replace("psql+psycopg2:", "postgresql+psycopg2:", 1)
 
-    if lower.startswith("postgresql://"):
-        # psycopg2 드라이버 명시 (없어도 되지만 일관성 있게)
-        if "+psycopg2://" not in lower:
-            url = "postgresql+psycopg2://" + url.split("://", 1)[1]
+    # 채널바인딩 등 쿼리스트링은 그대로 두되, 스킴만 보정
+    if s.startswith("postgres://"):
+        s = s.replace("postgres://", "postgresql+psycopg2://", 1)
+    elif s.startswith("postgresql://"):
+        s = s.replace("postgresql://", "postgresql+psycopg2://", 1)
 
-        # sslmode 누락 시 require 부여(Neon 기본)
-        if "sslmode=" not in url:
-            sep = "&" if "?" in url else "?"
-            url = f"{url}{sep}sslmode=require"
+    # sqlite 단축형 보정
+    if s.startswith("sqlite:/./"):
+        # 'sqlite:/./users.db' 같은 오타 -> 'sqlite:///./users.db'
+        s = s.replace("sqlite:/./", "sqlite:///./", 1)
 
-    # 절대 금지: 'psql+psycopg2:postgresql://...' 같은 잘못된 접두어
-    if url.lower().startswith("psql+psycopg2:postgresql://"):
-        url = url.replace("psql+psycopg2:postgresql://", "postgresql+psycopg2://")
+    return s
 
-    return url
 
-RESOLVED_DB_URL = _normalize_db_url(RAW_DB_URL)
+RAW_DATABASE_URL = os.getenv("DATABASE_URL")
+DATABASE_URL = normalize_db_url(RAW_DATABASE_URL)
 
-# DB 연결
-engine = create_engine(
-    RESOLVED_DB_URL,
-    pool_pre_ping=True,
-)
-SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+if not DATABASE_URL:
+    # 안전한 기본값 (로컬 개발용)
+    DATABASE_URL = "sqlite:///./users.db"
+    DB_BACKEND = "sqlite"
+else:
+    DB_BACKEND = "postgresql"
 
-# 암호화
-pwd_ctx = CryptContext(schemes=["bcrypt"], deprecated="auto")
 
+engine = create_engine(DATABASE_URL, pool_pre_ping=True, future=True)
+SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False, future=True)
+
+
+# -----------------------------------------------------------------------------
+# ORM
+# -----------------------------------------------------------------------------
+class Base(DeclarativeBase):
+    pass
+
+
+class User(Base):
+    __tablename__ = "users"
+
+    # 문자열 PK (분점/사번 형태 등)
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    username: Mapped[str] = mapped_column(String(64), unique=True, nullable=False, index=True)
+    password_hash: Mapped[str] = mapped_column(String(255), nullable=False)
+
+    # 조직 정보
+    org: Mapped[Optional[str]] = mapped_column(String(128), nullable=True)
+    dept: Mapped[Optional[str]] = mapped_column(String(128), nullable=True)
+
+    # 근무/계약 기간
+    start_date: Mapped[Optional[dt.date]] = mapped_column(Date, nullable=True)
+    end_date: Mapped[Optional[dt.date]]   = mapped_column(Date, nullable=True)
+
+    # 권한/활성
+    role: Mapped[Optional[str]] = mapped_column(String(32), nullable=True, default="user")
+    active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+
+    created_at: Mapped[dt.datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=func.now()
+    )
+
+    sessions: Mapped[List["SessionModel"]] = relationship(
+        back_populates="user", cascade="all, delete-orphan"
+    )
+
+
+class SessionModel(Base):
+    __tablename__ = "sessions"
+
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)  # 세션/토큰 식별자
+    user_id: Mapped[str] = mapped_column(
+        String(64),
+        ForeignKey("users.id", ondelete="CASCADE"),
+        index=True,
+        nullable=False
+    )
+    created_at: Mapped[dt.datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    expires_at: Mapped[Optional[dt.datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    user: Mapped[User] = relationship(back_populates="sessions")
+
+
+# -----------------------------------------------------------------------------
 # FastAPI
-app = FastAPI()
+# -----------------------------------------------------------------------------
+app = FastAPI(
+    title=SERVICE_NAME,
+    version=VERSION
+)
 
-# CORS (Electron 포함 모든 출처 허용)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
     allow_credentials=True,
-    allow_methods=["*"],
+    allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS", "HEAD"],  # HEAD 포함
     allow_headers=["*"],
 )
 
 
-# ------------------------------------------------------------
-# 유틸
-# ------------------------------------------------------------
-def db_exec(sql: str, params: Optional[Dict[str, Any]] = None, fetch: bool = False):
-    with engine.connect() as conn:
-        if fetch:
-            return conn.execute(text(sql), params or {}).mappings().all()
-        else:
-            conn.execute(text(sql), params or {})
-            conn.commit()
-            return None
-
-def get_user_by_id_or_username(db, uid: str):
-    # users 테이블 스키마가 프로젝트마다 조금씩 달라서 최소 필드만 읽음
-    # 필요한 컬럼: id, username, password_hash, role, org, active(없으면 True 처리)
-    row = db.execute(text("""
-        SELECT id, username, password_hash, role, org,
-               CASE
-                 WHEN EXISTS(
-                   SELECT 1
-                   FROM information_schema.columns
-                   WHERE table_name = 'users' AND column_name = 'active'
-                 )
-                 THEN active
-                 ELSE TRUE
-               END as active
-        FROM users
-        WHERE id = :uid OR username = :uid
-        LIMIT 1
-    """), {"uid": uid}).mappings().first()
-    return row
-
-def verify_password(plain: str, hashed: str) -> bool:
-    try:
-        return pwd_ctx.verify(plain, hashed)
-    except Exception:
-        return False
-
-def hash_password(pw: str) -> str:
-    return pwd_ctx.hash(pw)
-
-
-# ------------------------------------------------------------
-# 세션(동시로그인 차단) 테이블 보장 & 마이그레이션
-# ------------------------------------------------------------
-def ensure_schema_and_migrate():
-    # users.id 를 varchar(64)로(이미 완료되어 있으면 무시)
-    try:
-        db_exec("""ALTER TABLE users ALTER COLUMN id DROP DEFAULT;""")
-    except Exception:
-        pass
-    try:
-        db_exec("""ALTER TABLE users ALTER COLUMN id TYPE VARCHAR(64) USING id::text;""")
-    except Exception as e:
-        # 이미 varchar거나 FK 충돌 등은 무시(로그만)
-        logging.warning("[migrate] users.id alter attempt: %s", e)
-
-    # sessions 테이블 생성(없으면)
-    db_exec("""
-    CREATE TABLE IF NOT EXISTS sessions (
-        sid UUID PRIMARY KEY,
-        user_id VARCHAR(64) NOT NULL,
-        created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-        expires_at TIMESTAMPTZ NOT NULL,
-        revoked BOOLEAN NOT NULL DEFAULT FALSE
-    );
-    """)
-    # FK 정비(이미 있으면 무시)
-    try:
-        db_exec("""ALTER TABLE sessions DROP CONSTRAINT IF EXISTS sessions_user_id_fkey;""")
-        db_exec("""ALTER TABLE sessions
-                  ADD CONSTRAINT sessions_user_id_fkey
-                  FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE;""")
-    except Exception as e:
-        logging.warning("[migrate] sessions FK: %s", e)
-
-    # 인덱스
-    db_exec("""CREATE INDEX IF NOT EXISTS ix_sessions_user_id ON sessions(user_id);""")
-    db_exec("""CREATE INDEX IF NOT EXISTS ix_sessions_active ON sessions(user_id, revoked, expires_at);""")
-
-
-@app.on_event("startup")
-def on_startup():
-    ensure_schema_and_migrate()
-    logging.info("[startup] %s %s db=%s", SERVICE_NAME, VERSION,
-                 "postgresql" if RESOLVED_DB_URL.startswith("postgresql") else "sqlite")
-
-
-# ------------------------------------------------------------
-# 모델 (Pydantic)
-# ------------------------------------------------------------
+# -----------------------------------------------------------------------------
+# Schemas
+# -----------------------------------------------------------------------------
 class LoginBody(BaseModel):
     id: str
     password: str
 
 
-# ------------------------------------------------------------
-# 인증 공통
-# ------------------------------------------------------------
-def create_token(user_id: str, role: str, sid: str) -> str:
-    exp = datetime.now(tz=timezone.utc) + timedelta(hours=JWT_EXPIRE_HOURS)
-    payload = {"sub": user_id, "role": role, "sid": sid, "exp": exp}
-    return jwt.encode(payload, SECRET_KEY, algorithm=ALGORITHM)
+class UserCreateBody(BaseModel):
+    id: str
+    username: str
+    password: str
+    org: Optional[str] = None
+    dept: Optional[str] = None
+    role: Optional[str] = "user"
+    active: Optional[bool] = True
 
-def decode_token(token: str) -> Dict[str, Any]:
+
+class UserUpdateBody(BaseModel):
+    username: Optional[str] = None
+    password: Optional[str] = None
+    org: Optional[str] = None
+    dept: Optional[str] = None
+    role: Optional[str] = None
+    active: Optional[bool] = None
+
+
+# -----------------------------------------------------------------------------
+# Utils: password / jwt
+# -----------------------------------------------------------------------------
+SECRET_KEY = os.getenv("SECRET_KEY", "change-me-in-prod")
+JWT_ALG = "HS256"
+JWT_TTL_HOURS = int(os.getenv("JWT_TTL_HOURS", "24"))
+
+def hash_password(plain: str) -> str:
+    return bcrypt.hashpw(plain.encode("utf-8"), bcrypt.gensalt()).decode("utf-8")
+
+def verify_password(plain: str, hashed: str) -> bool:
     try:
-        return jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
-    except jwt.ExpiredSignatureError:
-        raise HTTPException(status_code=401, detail="token expired")
+        return bcrypt.checkpw(plain.encode("utf-8"), hashed.encode("utf-8"))
     except Exception:
-        raise HTTPException(status_code=401, detail="invalid token")
+        return False
 
-def bearer_token(auth_header: Optional[str] = Header(None)) -> str:
-    if not auth_header or not auth_header.lower().startswith("bearer "):
-        raise HTTPException(status_code=401, detail="missing bearer token")
-    return auth_header.split(" ", 1)[1]
+def new_session_id() -> str:
+    return uuid.uuid4().hex
+
+def create_jwt(user_id: str, role: str, sid: str) -> str:
+    exp = dt.datetime.utcnow() + dt.timedelta(hours=JWT_TTL_HOURS)
+    payload = {"sub": user_id, "role": role, "sid": sid, "exp": exp}
+    return jwt.encode(payload, SECRET_KEY, algorithm=JWT_ALG)
+
+def decode_jwt(token: str) -> dict:
+    try:
+        return jwt.decode(token, SECRET_KEY, algorithms=[JWT_ALG])
+    except jwt.ExpiredSignatureError:
+        raise HTTPException(status_code=401, detail="Token expired")
+    except jwt.InvalidTokenError:
+        raise HTTPException(status_code=401, detail="Invalid token")
 
 
-def require_user(auth: str = Depends(bearer_token)) -> Dict[str, Any]:
-    payload = decode_token(auth)
+# -----------------------------------------------------------------------------
+# DB / Migrations (best-effort)
+# -----------------------------------------------------------------------------
+def col_exists(db: Session, table: str, col: str) -> bool:
+    if DB_BACKEND == "sqlite":
+        q = text(f"PRAGMA table_info({table})")
+        rows = db.execute(q).all()
+        return any(r[1] == col for r in rows)
+    else:
+        q = text("""
+            SELECT 1
+            FROM information_schema.columns
+            WHERE table_name = :t AND column_name = :c
+        """)
+        return db.execute(q, {"t": table, "c": col}).first() is not None
+
+
+def ensure_schema_and_migrate():
+    Base.metadata.create_all(engine)
+
+    with SessionLocal() as db:
+        # users.id가 문자열 아닌 경우(이전 integer) → varchar로 시도
+        try:
+            if DB_BACKEND != "sqlite":
+                # 실제 타입 확인
+                t = db.execute(text("""
+                    SELECT data_type
+                    FROM information_schema.columns
+                    WHERE table_name='users' AND column_name='id'
+                """)).scalar()
+                if t and t.lower() not in ("character varying", "text"):
+                    # 관계(세션) 등 때문에 실패 가능 → 예외는 무시
+                    db.execute(text("ALTER TABLE users ALTER COLUMN id TYPE VARCHAR(64) USING id::text"))
+                    db.commit()
+        except Exception:
+            db.rollback()
+
+        # sessions.user_id를 varchar(64)로
+        try:
+            if DB_BACKEND != "sqlite":
+                t = db.execute(text("""
+                    SELECT data_type
+                    FROM information_schema.columns
+                    WHERE table_name='sessions' AND column_name='user_id'
+                """)).scalar()
+                if t and t.lower() not in ("character varying", "text"):
+                    db.execute(text("ALTER TABLE sessions ALTER COLUMN user_id TYPE VARCHAR(64) USING user_id::text"))
+                    db.commit()
+        except Exception:
+            db.rollback()
+
+        # sessions.expires_at 없으면 추가
+        try:
+            if not col_exists(db, "sessions", "expires_at"):
+                if DB_BACKEND == "sqlite":
+                    db.execute(text("ALTER TABLE sessions ADD COLUMN expires_at TIMESTAMP"))
+                else:
+                    db.execute(text("ALTER TABLE sessions ADD COLUMN expires_at TIMESTAMPTZ"))
+                db.commit()
+        except Exception:
+            db.rollback()
+
+
+def seed_admin():
+    """최초 배포 시 관리자 계정(rnj88/6548) 자동 생성(없을 때만)"""
+    admin_id = "rnj88"
+    with SessionLocal() as db:
+        u = db.get(User, admin_id)
+        if u:
+            return
+        u = User(
+            id=admin_id,
+            username="rnj88",
+            password_hash=hash_password("6548"),
+            org="ryoryocompany",
+            role="admin",
+            active=True,
+        )
+        db.add(u)
+        db.commit()
+
+
+# -----------------------------------------------------------------------------
+# Dependencies
+# -----------------------------------------------------------------------------
+def get_db():
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
+
+
+def bearer_auth(authorization: Optional[str] = Header(None)) -> str:
+    if not authorization:
+        raise HTTPException(status_code=401, detail="Missing Authorization")
+    parts = authorization.split()
+    if len(parts) != 2 or parts[0].lower() != "bearer":
+        raise HTTPException(status_code=401, detail="Invalid Authorization header")
+    return parts[1]
+
+
+def get_current_user(token: str = Depends(bearer_auth), db: Session = Depends(get_db)) -> User:
+    payload = decode_jwt(token)
+    user_id = payload.get("sub")
     sid = payload.get("sid")
-    uid = payload.get("sub")
-    if not sid or not uid:
-        raise HTTPException(status_code=401, detail="invalid token payload")
+    if not user_id or not sid:
+        raise HTTPException(status_code=401, detail="Invalid token payload")
 
-    # 세션 유효성(동시로그인 차단 핵심)
-    row = db_exec("""
-        SELECT sid, user_id, revoked, expires_at
-        FROM sessions
-        WHERE sid = :sid AND user_id = :uid
-        LIMIT 1
-    """, {"sid": sid, "uid": uid}, fetch=True)
-    if not row:
-        raise HTTPException(status_code=401, detail="session revoked or not found")
-    s = row[0]
-    if s["revoked"]:
-        raise HTTPException(status_code=401, detail="session revoked")
-    if s["expires_at"] <= datetime.now(timezone.utc):
-        raise HTTPException(status_code=401, detail="session expired")
+    # 세션 유효성 확인(단일 로그인 보장: 해당 sid 가 실제 존재해야 함)
+    sess = db.get(SessionModel, sid)
+    if not sess or sess.user_id != user_id:
+        raise HTTPException(status_code=401, detail="Session not found")
 
-    return payload  # {"sub":..., "role":..., "sid":...}
+    if sess.expires_at and sess.expires_at < dt.datetime.utcnow().replace(tzinfo=dt.timezone.utc):
+        # 만료 세션
+        db.delete(sess)
+        db.commit()
+        raise HTTPException(status_code=401, detail="Session expired")
+
+    u = db.get(User, user_id)
+    if not u or not u.active:
+        raise HTTPException(status_code=401, detail="Inactive or not found")
+    return u
 
 
-# ------------------------------------------------------------
-# 라우트
-# ------------------------------------------------------------
-@app.get("/")
+def admin_required(u: User = Depends(get_current_user)) -> User:
+    if (u.role or "").lower() != "admin":
+        raise HTTPException(status_code=403, detail="Admin only")
+    return u
+
+
+# -----------------------------------------------------------------------------
+# Health / Root (Render 헬스체크: HEAD 200 보장)
+# -----------------------------------------------------------------------------
+@app.get("/", include_in_schema=False)
 def root():
-    backend = "postgresql" if RESOLVED_DB_URL.startswith("postgresql") else "sqlite"
     return {
         "ok": True,
         "service": SERVICE_NAME,
-        "brand": BRAND,
         "version": VERSION,
-        "db_backend": backend,
-        "raw_database_url": RAW_DB_URL if RAW_DB_URL else "sqlite:///./users.db",
-        "resolved_database_url": RESOLVED_DB_URL,
+        "db_backend": DB_BACKEND,
+        "raw_database_url": RAW_DATABASE_URL or "(unset)",
+        "resolved_database_url": DATABASE_URL,
+    }
+
+@app.head("/", include_in_schema=False)
+def root_head():
+    return Response(status_code=200)
+
+@app.get("/healthz", include_in_schema=False)
+def healthz():
+    return {"ok": True}
+
+@app.head("/healthz", include_in_schema=False)
+def healthz_head():
+    return Response(status_code=200)
+
+
+# -----------------------------------------------------------------------------
+# Auth
+# -----------------------------------------------------------------------------
+@app.post("/auth/login")
+def login(body: LoginBody, db: Session = Depends(get_db)):
+    # id로 우선 검색(없으면 username으로 fallback)
+    u = db.get(User, body.id)
+    if not u:
+        u = db.scalar(select(User).where(User.username == body.id))
+    if not u:
+        raise HTTPException(status_code=401, detail="Invalid credentials")
+
+    if not u.active or not verify_password(body.password, u.password_hash):
+        raise HTTPException(status_code=401, detail="Invalid credentials")
+
+    # 단일 로그인 보장: 기존 세션 모두 제거
+    db.execute(text("DELETE FROM sessions WHERE user_id = :uid"), {"uid": u.id})
+
+    sid = new_session_id()
+    exp = dt.datetime.utcnow().replace(tzinfo=dt.timezone.utc) + dt.timedelta(hours=JWT_TTL_HOURS)
+
+    s = SessionModel(id=sid, user_id=u.id, expires_at=exp)
+    db.add(s)
+    db.commit()
+
+    token = create_jwt(u.id, u.role or "user", sid)
+    return {
+        "ok": True,
+        "id": u.id,
+        "username": u.username,
+        "role": u.role or "user",
+        "org": u.org,
+        "token": token,
     }
 
 
-@app.post("/auth/login")
-def login(body: LoginBody, request: Request):
-    with engine.connect() as conn:
-        u = get_user_by_id_or_username(conn, body.id)
-        if not u:
-            raise HTTPException(status_code=401, detail="invalid credentials")
-
-        if not verify_password(body.password, u["password_hash"]):
-            raise HTTPException(status_code=401, detail="invalid credentials")
-
-        if not u["active"]:
-            raise HTTPException(status_code=403, detail="inactive user")
-
-        # 기존 세션 전부 revoke(한 아이디 1세션 정책)
-        conn.execute(text("""
-            UPDATE sessions SET revoked = TRUE
-            WHERE user_id = :uid AND revoked = FALSE
-        """), {"uid": u["id"]})
-
-        # 새 세션 발급
-        sid = str(uuid.uuid4())
-        expires_at = datetime.now(timezone.utc) + timedelta(hours=JWT_EXPIRE_HOURS)
-        conn.execute(text("""
-            INSERT INTO sessions (sid, user_id, expires_at, revoked)
-            VALUES (:sid, :uid, :exp, FALSE)
-        """), {"sid": sid, "uid": u["id"], "exp": expires_at})
-        conn.commit()
-
-        token = create_token(u["id"], u["role"] or "user", sid)
-
-        return {
-            "ok": True,
-            "id": u["id"],
-            "username": u["username"],
-            "role": u["role"],
-            "org": u["org"],
-            "token": token,
-        }
-
-
 @app.get("/auth/me")
-def me(user=Depends(require_user)):
-    # 토큰 확인 + 세션 유효성은 require_user에서 이미 체크됨
-    uid = user["sub"]
-    with engine.connect() as conn:
-        u = get_user_by_id_or_username(conn, uid)
-        if not u:
-            raise HTTPException(status_code=404, detail="user not found")
-        return {
-            "ok": True,
-            "id": u["id"],
-            "username": u["username"],
-            "role": u["role"],
-            "org": u["org"],
-        }
+def me(u: User = Depends(get_current_user)):
+    return {
+        "ok": True,
+        "id": u.id,
+        "username": u.username,
+        "role": u.role or "user",
+        "org": u.org,
+        "dept": u.dept,
+        "active": u.active,
+        "created_at": u.created_at,
+    }
 
 
 @app.post("/auth/logout")
-def logout(user=Depends(require_user)):
-    sid = user["sid"]
-    uid = user["sub"]
-    db_exec("""
-        UPDATE sessions SET revoked = TRUE
-        WHERE sid = :sid AND user_id = :uid
-    """, {"sid": sid, "uid": uid})
+def logout(u: User = Depends(get_current_user), token: str = Depends(bearer_auth), db: Session = Depends(get_db)):
+    # 현재 토큰의 sid만 제거
+    payload = decode_jwt(token)
+    sid = payload.get("sid")
+    if sid:
+        db.execute(text("DELETE FROM sessions WHERE id = :sid"), {"sid": sid})
+        db.commit()
     return {"ok": True}
+
+
+# -----------------------------------------------------------------------------
+# Admin: users CRUD
+# -----------------------------------------------------------------------------
+@app.get("/admin/users")
+def list_users(_: User = Depends(admin_required), db: Session = Depends(get_db)):
+    rows = db.execute(select(User)).scalars().all()
+    return [
+        {
+            "id": r.id,
+            "username": r.username,
+            "org": r.org,
+            "dept": r.dept,
+            "role": r.role,
+            "active": r.active,
+            "created_at": r.created_at
+        }
+        for r in rows
+    ]
+
+
+@app.post("/admin/users")
+def create_user(body: UserCreateBody, _: User = Depends(admin_required), db: Session = Depends(get_db)):
+    if db.get(User, body.id) or db.scalar(select(User).where(User.username == body.username)):
+        raise HTTPException(status_code=409, detail="User already exists")
+
+    u = User(
+        id=body.id,
+        username=body.username,
+        password_hash=hash_password(body.password),
+        org=body.org,
+        dept=body.dept,
+        role=body.role or "user",
+        active=True if body.active is None else bool(body.active),
+    )
+    db.add(u)
+    db.commit()
+    return {"ok": True}
+
+
+@app.put("/admin/users/{user_id}")
+def update_user(user_id: str, body: UserUpdateBody, _: User = Depends(admin_required), db: Session = Depends(get_db)):
+    u = db.get(User, user_id)
+    if not u:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    if body.username is not None:
+        # 다른 유저와 중복 방지
+        exists = db.scalar(select(User).where(User.username == body.username, User.id != user_id))
+        if exists:
+            raise HTTPException(status_code=409, detail="Username already taken")
+        u.username = body.username
+
+    if body.password:
+        u.password_hash = hash_password(body.password)
+
+    if body.org is not None:
+        u.org = body.org
+    if body.dept is not None:
+        u.dept = body.dept
+    if body.role is not None:
+        u.role = body.role
+    if body.active is not None:
+        u.active = bool(body.active)
+
+    db.add(u)
+    db.commit()
+    return {"ok": True}
+
+
+@app.delete("/admin/users/{user_id}")
+def delete_user(user_id: str, _: User = Depends(admin_required), db: Session = Depends(get_db)):
+    u = db.get(User, user_id)
+    if not u:
+        raise HTTPException(status_code=404, detail="User not found")
+    db.delete(u)  # sessions는 FK CASCADE
+    db.commit()
+    return {"ok": True}
+
+
+# -----------------------------------------------------------------------------
+# Startup
+# -----------------------------------------------------------------------------
+@app.on_event("startup")
+def on_startup():
+    ensure_schema_and_migrate()
+    seed_admin()
+
 
 
 
