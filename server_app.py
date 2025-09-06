@@ -19,7 +19,7 @@ import jwt  # PyJWT
 # ------------------------------------------------------------------------------
 DATABASE_URL = os.getenv("DATABASE_URL", "postgresql+psycopg2://user:pass@localhost:5432/db")
 JWT_SECRET   = os.getenv("JWT_SECRET", "change-me")
-JWT_ALG      = "HS256"
+JWT_ALG      = os.getenv("JWT_ALG", "HS256")
 SESSION_TTL_HOURS = int(os.getenv("SESSION_TTL_HOURS", "12"))
 
 engine = create_engine(DATABASE_URL, pool_pre_ping=True, future=True)
@@ -32,25 +32,25 @@ pwd_ctx = CryptContext(schemes=["bcrypt"], deprecated="auto")
 # ------------------------------------------------------------------------------
 class User(Base):
     __tablename__ = "users"
-    id           = Column(String(64), primary_key=True)           # ex) rnj88
-    username     = Column(String(64), unique=True, index=True, nullable=False)
-    password_hash= Column(String(255), nullable=False)
-    org          = Column(String(128), nullable=True)              # 회사/기관
-    dept         = Column(String(128), nullable=True)              # 부서
-    role         = Column(String(32),  nullable=False, default="user")
-    active       = Column(Boolean,     nullable=False, server_default=text("true"))
-    start_date   = Column(DateTime(timezone=True), nullable=True)
-    end_date     = Column(DateTime(timezone=True), nullable=True)
-    created_at   = Column(DateTime(timezone=True), server_default=func.now())
+    id            = Column(String(64), primary_key=True)           # ex) rnj88
+    username      = Column(String(64), unique=True, index=True, nullable=False)
+    password_hash = Column(String(255), nullable=False)
+    org           = Column(String(128), nullable=True)             # 회사/기관
+    dept          = Column(String(128), nullable=True)             # 부서
+    role          = Column(String(32),  nullable=False, default="user")
+    active        = Column(Boolean,     nullable=False, server_default=text("true"))
+    start_date    = Column(DateTime(timezone=True), nullable=True)
+    end_date      = Column(DateTime(timezone=True), nullable=True)
+    created_at    = Column(DateTime(timezone=True), server_default=func.now())
 
-    sessions     = relationship("Session", back_populates="user", cascade="all,delete")
+    sessions      = relationship("Session", back_populates="user", cascade="all,delete")
 
 
 class Session(Base):
     __tablename__ = "sessions"
-    # ★ 문자형 PK로 고정 (정수 아님)
+    # 문자형 PK
     id         = Column(String(64), primary_key=True)                         # secrets.token_hex(16)
-    token      = Column(Text, nullable=False, unique=True, index=True)        # 발급한 JWT 자체 저장 (NOT NULL)
+    token      = Column(Text, nullable=False, unique=True, index=True)        # 발급한 JWT 저장
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     revoked    = Column(Boolean, nullable=False, server_default=text("false"))
     expires_at = Column(DateTime(timezone=True), nullable=False,
@@ -112,6 +112,11 @@ app.add_middleware(
     allow_methods=["*"], allow_headers=["*"]
 )
 
+# 규정 API(별도 DB): rules_api.py 를 같은 폴더에 두고 사용
+from rules_api import router as rules_router, init_rules_db  # 파일명이 다르면 여기만 맞춰주세요.
+init_rules_db()
+app.include_router(rules_router)
+
 def db_dep():
     db = SessionLocal()
     try:
@@ -156,7 +161,7 @@ def verify_token_and_session(db: OrmSession, token: str):
     if sess.expires_at <= datetime.now(timezone.utc):
         raise HTTPException(status_code=401, detail="session expired")
 
-    user = db.query(User).get(uid)
+    user = db.get(User, uid)
     if not user or not user.active:
         raise HTTPException(status_code=401, detail="user disabled")
 
@@ -165,6 +170,10 @@ def verify_token_and_session(db: OrmSession, token: str):
 # ------------------------------------------------------------------------------
 # 라우트
 # ------------------------------------------------------------------------------
+@app.get("/")
+def ping():
+    return {"ok": True, "service": "auth+rules"}
+
 @app.post("/auth/login", response_model=LoginOut)
 def login(body: LoginIn, db: OrmSession = Depends(db_dep)):
     uid = (body.id or "").strip()
@@ -185,7 +194,7 @@ def login(body: LoginIn, db: OrmSession = Depends(db_dep)):
     db.add(Session(
         id=sid,
         user_id=user.id,
-        token=token,           # ★ NOT NULL, DB 저장
+        token=token,           # NOT NULL, DB 저장
         expires_at=exp,
         revoked=False
     ))
@@ -207,7 +216,7 @@ def logout(request: Request, db: OrmSession = Depends(db_dep)):
     db.commit()
     return {"ok": True}
 
-# -------------------------- Admin (간단 구현) -------------------------------
+# -------------------------- Admin -------------------------------
 def ensure_admin(user: User):
     if (user.role or "").lower() != "admin":
         raise HTTPException(status_code=403, detail="admin only")
@@ -229,7 +238,7 @@ def admin_create_user(body: UserIn, request: Request, db: OrmSession = Depends(d
     user, _, _ = verify_token_and_session(db, token)
     ensure_admin(user)
 
-    if db.query(User).get(body.id):
+    if db.get(User, body.id):
         raise HTTPException(409, detail="id exists")
 
     pw_hash = pwd_ctx.hash(body.password or "6548")
@@ -250,8 +259,9 @@ def admin_update_user(uid: str, body: UserIn, request: Request, db: OrmSession =
     user, _, _ = verify_token_and_session(db, token)
     ensure_admin(user)
 
-    row = db.query(User).get(uid)
-    if not row: raise HTTPException(404, detail="not found")
+    row = db.get(User, uid)
+    if not row:
+        raise HTTPException(404, detail="not found")
 
     row.username = body.username or row.username
     row.org = body.org
@@ -274,8 +284,9 @@ def admin_delete_user(uid: str, request: Request, db: OrmSession = Depends(db_de
     user, _, _ = verify_token_and_session(db, token)
     ensure_admin(user)
 
-    row = db.query(User).get(uid)
-    if not row: raise HTTPException(404, detail="not found")
+    row = db.get(User, uid)
+    if not row:
+        raise HTTPException(404, detail="not found")
     db.delete(row); db.commit()
     return {"ok": True}
 
@@ -285,6 +296,8 @@ def admin_delete_user(uid: str, request: Request, db: OrmSession = Depends(db_de
 @app.on_event("startup")
 def on_startup():
     Base.metadata.create_all(bind=engine)
+
+
 
 
 
