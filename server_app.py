@@ -8,7 +8,7 @@ from fastapi import FastAPI, HTTPException, Depends, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from sqlalchemy import (
-    create_engine, Column, String, Boolean, DateTime, Text, ForeignKey, func, text
+    create_engine, Column, String, Boolean, DateTime, Text, ForeignKey, func, text, select
 )
 from sqlalchemy.orm import declarative_base, sessionmaker, Session as OrmSession, relationship
 from passlib.context import CryptContext
@@ -17,10 +17,13 @@ import jwt  # PyJWT
 # ------------------------------------------------------------------------------
 # 환경
 # ------------------------------------------------------------------------------
-DATABASE_URL = os.getenv("DATABASE_URL", "postgresql+psycopg2://user:pass@localhost:5432/db")
-JWT_SECRET   = os.getenv("JWT_SECRET", "change-me")
-JWT_ALG      = os.getenv("JWT_ALG", "HS256")
-SESSION_TTL_HOURS = int(os.getenv("SESSION_TTL_HOURS", "12"))
+DATABASE_URL        = os.getenv("DATABASE_URL", "postgresql+psycopg2://user:pass@localhost:5432/db")
+RULES_DATABASE_URL  = os.getenv("RULES_DATABASE_URL", "postgresql://ai_appeal_db_user:tQNCd98GrICo1F3Y4S7Stgqo8rKakzsx@dpg-d2tousvfte5s73af5g4g-a/ai_appeal_db")  # 규정 DB(실제 사용은 rules_api.py에서 함)
+JWT_SECRET          = os.getenv("JWT_SECRET", "change-me")
+JWT_ALG             = os.getenv("JWT_ALG", "HS256")
+SESSION_TTL_HOURS   = int(os.getenv("SESSION_TTL_HOURS", "12"))
+ADMIN_BOOTSTRAP_ID  = os.getenv("ADMIN_BOOTSTRAP_ID", "")
+ADMIN_BOOTSTRAP_PASSWORD = os.getenv("ADMIN_BOOTSTRAP_PASSWORD", "")
 
 engine = create_engine(DATABASE_URL, pool_pre_ping=True, future=True)
 SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False, future=True)
@@ -48,7 +51,7 @@ class User(Base):
 
 class Session(Base):
     __tablename__ = "sessions"
-    # 문자형 PK
+    # 문자열 PK
     id         = Column(String(64), primary_key=True)                         # secrets.token_hex(16)
     token      = Column(Text, nullable=False, unique=True, index=True)        # 발급한 JWT 저장
     created_at = Column(DateTime(timezone=True), server_default=func.now())
@@ -113,7 +116,7 @@ app.add_middleware(
 )
 
 # 규정 API(별도 DB): rules_api.py 를 같은 폴더에 두고 사용
-from rules_api import router as rules_router, init_rules_db  # 파일명이 다르면 여기만 맞춰주세요.
+from rules_api import router as rules_router, init_rules_db  # 파일명이 다르면 여기만 맞추세요.
 init_rules_db()
 app.include_router(rules_router)
 
@@ -172,7 +175,11 @@ def verify_token_and_session(db: OrmSession, token: str):
 # ------------------------------------------------------------------------------
 @app.get("/")
 def ping():
-    return {"ok": True, "service": "auth+rules"}
+    return {
+        "ok": True,
+        "service": "auth+rules",
+        "rules_db": bool(RULES_DATABASE_URL)
+    }
 
 @app.post("/auth/login", response_model=LoginOut)
 def login(body: LoginIn, db: OrmSession = Depends(db_dep)):
@@ -291,11 +298,31 @@ def admin_delete_user(uid: str, request: Request, db: OrmSession = Depends(db_de
     return {"ok": True}
 
 # ------------------------------------------------------------------------------
-# 시작 시 테이블 생성(이미 있으면 무시)
+# 시작 시 테이블 생성 + 최초 관리자 부트스트랩(옵션)
 # ------------------------------------------------------------------------------
 @app.on_event("startup")
 def on_startup():
+    # 기본 테이블 생성
     Base.metadata.create_all(bind=engine)
+
+    # --- 최초 관리자 1회 생성(환경변수로 제어) ---
+    if ADMIN_BOOTSTRAP_ID and ADMIN_BOOTSTRAP_PASSWORD:
+        with SessionLocal() as db:
+            exists = db.execute(select(User).where(User.id == ADMIN_BOOTSTRAP_ID)).scalar_one_or_none()
+            if not exists:
+                row = User(
+                    id=ADMIN_BOOTSTRAP_ID,
+                    username=ADMIN_BOOTSTRAP_ID,
+                    password_hash=pwd_ctx.hash(ADMIN_BOOTSTRAP_PASSWORD),
+                    org="",
+                    dept="",
+                    role="admin",
+                    active=True,
+                )
+                db.add(row)
+                db.commit()
+
+
 
 
 
