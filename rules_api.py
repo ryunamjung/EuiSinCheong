@@ -1,38 +1,67 @@
-# rules_api.py (final) — Rules DB (separate) + snapshot + admin CRUD
+# rules_api.py — Neon/psycopg2 안전 연결 + Rules CRUD/Snapshot
 import os
+import re
 import datetime as dt
 from typing import List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Header, status
 from pydantic import BaseModel
-from sqlalchemy import create_engine, String, Integer, Boolean, DateTime, Text, Table, Column, select, desc
+from sqlalchemy import (
+    create_engine, String, Integer, Boolean, DateTime, Text, Table, Column,
+    select, desc
+)
 from sqlalchemy.orm import registry, sessionmaker, Session
 import jwt  # PyJWT
 
-# ------------------------- DB -------------------------
-RAW_URL = os.getenv("RULES_DATABASE_URL") or os.getenv("DATABASE_URL")
-if not RAW_URL:
-    raise RuntimeError("RULES_DATABASE_URL or DATABASE_URL must be set")
+# ------------------------- DB URL 정규화 -------------------------
+def _normalize_db_url(raw: Optional[str]) -> str:
+    """
+    - postgres://  -> postgresql:// 로 교체
+    - 드라이버 미지정 시 postgresql+psycopg2:// 로 승격
+    - sslmode=require 가 없으면 추가(Neon 권장)
+    """
+    if not raw:
+        raise RuntimeError("RULES_DATABASE_URL or DATABASE_URL must be set")
 
-RULES_DATABASE_URL = RAW_URL.strip()
+    url = raw.strip()
 
-# psycopg2 접두사 보정
-if RULES_DATABASE_URL.startswith("postgres://"):
-    RULES_DATABASE_URL = RULES_DATABASE_URL.replace("postgres://", "postgresql+psycopg2://", 1)
-elif RULES_DATABASE_URL.startswith("postgresql://") and "+psycopg2" not in RULES_DATABASE_URL:
-    RULES_DATABASE_URL = RULES_DATABASE_URL.replace("postgresql://", "postgresql+psycopg2://", 1)
+    # 1) 스킴 보정
+    if url.startswith("postgres://"):
+        url = "postgresql://" + url[len("postgres://"):]
 
-# sslmode 보강
-if "postgresql+psycopg2://" in RULES_DATABASE_URL and "sslmode=" not in RULES_DATABASE_URL:
-    sep = "&" if "?" in RULES_DATABASE_URL else "?"
-    RULES_DATABASE_URL = f"{RULES_DATABASE_URL}{sep}sslmode=require"
+    # 2) 드라이버 명시(없으면 psycopg2로)
+    if url.startswith("postgresql://"):
+        url = url.replace("postgresql://", "postgresql+psycopg2://", 1)
 
-_engine = create_engine(RULES_DATABASE_URL, pool_pre_ping=True, future=True)
+    # 3) sslmode=require 강제(이미 있으면 유지)
+    if "sslmode=" not in url:
+        sep = "&" if "?" in url else "?"
+        url = f"{url}{sep}sslmode=require"
+
+    return url
+
+# ------------------------- DB 연결 -------------------------
+RULES_DATABASE_URL = os.getenv("RULES_DATABASE_URL") or os.getenv("DATABASE_URL")
+RULES_DATABASE_URL = _normalize_db_url(RULES_DATABASE_URL)
+
+# psycopg2용 connect_args (sslmode는 URL에 이미 붙였지만 안전하게 둠)
+connect_args = {}
+if "sslmode=" in RULES_DATABASE_URL and "sslmode=require" in RULES_DATABASE_URL:
+    connect_args["sslmode"] = "require"
+
+_engine = create_engine(
+    RULES_DATABASE_URL,
+    pool_pre_ping=True,           # 끊어진 커넥션 자동 감지
+    pool_recycle=1800,            # 30분 주기 재연결
+    pool_size=5,
+    max_overflow=5,
+    future=True,
+    connect_args=connect_args
+)
 RulesSessionLocal = sessionmaker(bind=_engine, autoflush=False, autocommit=False, future=True)
 
 mapper_registry = registry()
 metadata = mapper_registry.metadata
-
 
 rules_table = Table(
     "rules",
@@ -47,6 +76,7 @@ rules_table = Table(
 )
 
 def init_rules_db():
+    # 테이블 없으면 생성(데이터는 유지됨)
     metadata.create_all(_engine)
 
 # ------------------------- Auth -------------------------
@@ -105,11 +135,24 @@ class Snapshot(BaseModel):
 # ------------------------- Router -------------------------
 router = APIRouter(prefix="/rules", tags=["rules"])
 
+@router.get("/health")
+def rules_health():
+    # 간단한 커넥션 체크
+    try:
+        with _engine.connect() as conn:
+            conn.exec_driver_sql("SELECT 1")
+        return {"ok": True}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
 @router.get("/snapshot", response_model=Snapshot)
 def rules_snapshot(_user=Depends(_decode_token), db: Session = Depends(get_db)):
     rows = db.execute(
-        select(rules_table).where(rules_table.c.enabled == True).order_by(desc(rules_table.c.updated_at))
+        select(rules_table)
+        .where(rules_table.c.enabled == True)
+        .order_by(desc(rules_table.c.updated_at))
     ).fetchall()
+
     items = [RuleOut(**dict(r._mapping)) for r in rows]
     if items:
         latest = items[0]
@@ -117,7 +160,7 @@ def rules_snapshot(_user=Depends(_decode_token), db: Session = Depends(get_db)):
         updated_at = latest.updated_at
     else:
         version = 1
-        updated_at = dt.datetime(1970,1,1)
+        updated_at = dt.datetime(1970, 1, 1)
     return Snapshot(ok=True, version=version, updated_at=updated_at, items=items)
 
 # -------- Admin CRUD (requires role=admin) --------
@@ -148,13 +191,20 @@ def update_rule(rid: int, patch: RulePatch, _user=Depends(_decode_token), db: Se
     current = db.execute(select(rules_table).where(rules_table.c.id == rid)).first()
     if not current:
         raise HTTPException(404, "not found")
+
     values = {}
-    for k in ["title","body","tags","enabled","version"]:
+    for k in ["title", "body", "tags", "enabled", "version"]:
         v = getattr(patch, k, None)
         if v is not None:
             values[k] = v
     values["updated_at"] = dt.datetime.utcnow()
-    row = db.execute(rules_table.update().where(rules_table.c.id==rid).values(**values).returning(rules_table)).fetchone()
+
+    row = db.execute(
+        rules_table.update()
+        .where(rules_table.c.id == rid)
+        .values(**values)
+        .returning(rules_table)
+    ).fetchone()
     db.commit()
     return RuleOut(**dict(row._mapping))
 
@@ -166,4 +216,3 @@ def delete_rule(rid: int, _user=Depends(_decode_token), db: Session = Depends(ge
         raise HTTPException(404, "not found")
     db.commit()
     return {"ok": True}
-
