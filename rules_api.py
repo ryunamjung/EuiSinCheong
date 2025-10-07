@@ -10,15 +10,29 @@ from sqlalchemy.orm import registry, sessionmaker, Session
 import jwt  # PyJWT
 
 # ------------------------- DB -------------------------
-RULES_DATABASE_URL = os.getenv("RULES_DATABASE_URL") or os.getenv("DATABASE_URL")
-if not RULES_DATABASE_URL:
+RAW_URL = os.getenv("RULES_DATABASE_URL") or os.getenv("DATABASE_URL")
+if not RAW_URL:
     raise RuntimeError("RULES_DATABASE_URL or DATABASE_URL must be set")
+
+RULES_DATABASE_URL = RAW_URL.strip()
+
+# psycopg2 접두사 보정
+if RULES_DATABASE_URL.startswith("postgres://"):
+    RULES_DATABASE_URL = RULES_DATABASE_URL.replace("postgres://", "postgresql+psycopg2://", 1)
+elif RULES_DATABASE_URL.startswith("postgresql://") and "+psycopg2" not in RULES_DATABASE_URL:
+    RULES_DATABASE_URL = RULES_DATABASE_URL.replace("postgresql://", "postgresql+psycopg2://", 1)
+
+# sslmode 보강
+if "postgresql+psycopg2://" in RULES_DATABASE_URL and "sslmode=" not in RULES_DATABASE_URL:
+    sep = "&" if "?" in RULES_DATABASE_URL else "?"
+    RULES_DATABASE_URL = f"{RULES_DATABASE_URL}{sep}sslmode=require"
 
 _engine = create_engine(RULES_DATABASE_URL, pool_pre_ping=True, future=True)
 RulesSessionLocal = sessionmaker(bind=_engine, autoflush=False, autocommit=False, future=True)
 
 mapper_registry = registry()
 metadata = mapper_registry.metadata
+
 
 rules_table = Table(
     "rules",
@@ -152,3 +166,4 @@ def delete_rule(rid: int, _user=Depends(_decode_token), db: Session = Depends(ge
         raise HTTPException(404, "not found")
     db.commit()
     return {"ok": True}
+
