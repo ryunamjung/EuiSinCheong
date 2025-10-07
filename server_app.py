@@ -13,10 +13,26 @@ from sqlalchemy import (
 from sqlalchemy.orm import declarative_base, sessionmaker, Session as OrmSession, relationship
 from passlib.context import CryptContext
 import jwt  # PyJWT
+import re
 
 # ------------------------- ENV -------------------------
-DATABASE_URL        = os.getenv("DATABASE_URL", "postgresql+psycopg2://user:pass@localhost:5432/db")
-RULES_DATABASE_URL  = os.getenv("RULES_DATABASE_URL", "postgresql://ai_appeal_db_user:tQNCd98GrICo1F3Y4S7Stgqo8rKakzsx@dpg-d2tousvfte5s73af5g4g-a/ai_appeal_db")  # used by rules_api.py; surfaced for diagnostics
+def _norm_db_url(u: Optional[str], *, require=True) -> str:
+    if not u:
+        if require:
+            raise RuntimeError("DATABASE_URL must be set")
+        return u or ""
+    url = u.strip()
+    if url.startswith("postgres://"):
+        url = "postgresql://" + url[len("postgres://"):]
+    if url.startswith("postgresql://"):
+        url = url.replace("postgresql://", "postgresql+psycopg2://", 1)
+    if "sslmode=" not in url:
+        url += ("&" if "?" in url else "?") + "sslmode=require"
+    return url
+
+DATABASE_URL       = _norm_db_url(os.getenv("DATABASE_URL"))
+RULES_DATABASE_URL = os.getenv("RULES_DATABASE_URL")  # 진단용 표기만, 실제 연결은 rules_api 쪽
+
 JWT_SECRET          = os.getenv("JWT_SECRET", "change-me")
 JWT_ALG             = os.getenv("JWT_ALG", "HS256")
 SESSION_TTL_HOURS   = int(os.getenv("SESSION_TTL_HOURS", "12"))
@@ -296,3 +312,4 @@ def on_startup():
                 )
                 db.add(row)
                 db.commit()
+
